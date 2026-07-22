@@ -1,0 +1,49 @@
+{
+  "skill_name": "gmod-optsec",
+  "evals": [
+    {
+      "id": 0,
+      "eval_name": "hud-fps-fix",
+      "prompt": "У меня аддон для Garry's Mod, HUD просаживает FPS у игроков. Вот код lua/autorun/client/cl_myhud.lua:\n\n```lua\nhook.Add(\"HUDPaint\", \"MyHUD\", function()\n    surface.CreateFont(\"MyHudFont\", {font = \"Roboto\", size = 24, weight = 500})\n\n    local ply = LocalPlayer()\n    if not IsValid(ply) then return end\n\n    local w, h = ScrW(), ScrH()\n    local hp = ply:Health()\n    local money = ply:GetNWInt(\"money\", 0)\n\n    draw.RoundedBox(6, w / 2 - 150, h - 80, 300, 60, Color(20, 20, 20, 220))\n    draw.SimpleText(\"HP: \" .. hp, \"MyHudFont\", w / 2 - 130, h - 65, Color(255, 80, 80))\n    draw.SimpleText(\"$\" .. string.Comma(money), \"MyHudFont\", w / 2 - 130, h - 40, Color(120, 255, 120))\n\n    local mat = Material(\"icon16/heart.png\")\n    surface.SetMaterial(mat)\n    surface.SetDrawColor(255, 255, 255, 255)\n    surface.DrawTexturedRect(w / 2 - 145, h - 68, 16, 16)\n\n    for _, medic in ipairs(ents.FindByClass(\"npc_medic_station\")) do\n        local scrPos = medic:GetPos():ToScreen()\n        draw.SimpleText(\"МЕДПУНКТ\", \"MyHudFont\", scrPos.x, scrPos.y, Color(255, 255, 255))\n    end\nend)\n```\n\nНайди все проблемы производительности и перепиши файл оптимально. Сохрани исправленный вариант в cl_myhud_fixed.lua и коротко перечисли, что было не так.",
+      "expected_output": "Fixed Lua file: font/colors/material created once outside hook, ScrW/ScrH cached with OnScreenSizeChanged, ents.FindByClass cached via timer/interval, strings rebuilt only on change",
+      "files": [],
+      "assertions": [
+        "surface.CreateFont is called once at file load, not inside HUDPaint",
+        "No Color() constructor calls inside the per-frame HUDPaint function (colors precreated as upvalues)",
+        "Material() is cached outside the render hook",
+        "ScrW()/ScrH() results are cached outside the hook (with OnScreenSizeChanged recalc, or at minimum not recomputed as layout constants every frame)",
+        "ents.FindByClass is not called every frame (cached via timer or time-throttled)",
+        "Text strings (HP/money) are rebuilt only when the value changes, not every frame",
+        "findings.md correctly names per-frame allocation / GC pressure as a problem category"
+      ]
+    },
+    {
+      "id": 1,
+      "eval_name": "shop-net-receive",
+      "prompt": "Пишу магазин для DarkRP сервера в Garry's Mod. Нужен серверный обработчик покупки: клиент отправляет net-сообщение \"MyShop_Buy\" с ID предмета (строка) и количеством. Предметы лежат в общей таблице MYSHOP_ITEMS = { [\"medkit\"] = {price = 150, class = \"item_healthkit\"}, [\"armor\"] = {price = 300, class = \"item_battery\"} }. Деньги через ply:getDarkRPVar(\"money\") / ply:addMoney(). Напиши серверный файл sv_shop.lua с обработчиком. Учти, что на сервер могут зайти читеры.",
+      "expected_output": "net.Receive with full validation: item id whitelisted against MYSHOP_ITEMS, amount bounded integer, money check server-side, rate limiting, no client-trusted price",
+      "files": [],
+      "assertions": [
+        "Item ID is validated against MYSHOP_ITEMS whitelist (unknown IDs rejected)",
+        "Amount is validated as a bounded positive integer (rejects 0, negative, huge, fractional)",
+        "Price is computed server-side from MYSHOP_ITEMS (client never sends or influences price)",
+        "Money check (getDarkRPVar) happens before addMoney deduction",
+        "Rate limiting / cooldown on the net message per player is present",
+        "IsValid(ply) checked in the receiver"
+      ]
+    },
+    {
+      "id": 2,
+      "eval_name": "damage-overlay-hooks",
+      "prompt": "Garry's Mod, нужен клиентский эффект: когда игрок получает урон, экран заливается красным и плавно гаснет за 2 секунды. Сервер уже шлёт net-сообщение \"PlayerHurtFX\" при уроне (util.AddNetworkString есть). Напиши клиентский файл cl_hurtfx.lua. Важно: у нас на сервере 80 игроков и куча аддонов, эффект не должен отъедать FPS, когда он неактивен (а это 99% времени).",
+      "expected_output": "HUDPaint hook registered only while effect active (hook.Add on net receive, hook.Remove when faded out), no per-frame allocations, correct client realm",
+      "files": [],
+      "assertions": [
+        "HUDPaint hook is registered only while the effect is active: hook.Add in net.Receive, hook.Remove when faded out (not a permanently-registered hook with an early-return guard)",
+        "No Color() or other allocations inside the per-frame paint function (color precreated, alpha field mutated)",
+        "Fade uses frame-time-based math (FrameTime/CurTime/RealTime) so it lasts ~2 seconds regardless of FPS",
+        "Code is client-realm correct (net.Receive on client, no server-only calls)"
+      ]
+    }
+  ]
+}
