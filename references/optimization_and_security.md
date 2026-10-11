@@ -2,6 +2,12 @@
 
 > Полное руководство по всем аспектам, влияющим на производительность и защиту GMod-сервера.
 
+Примеры — фрагменты соответствующих client/server-файлов, не единый autorun.
+Повторяющиеся HUD/таймеры демонстрируют альтернативы: не подключай их вместе.
+Таймеры клиентской фичи запускай при её активации и удаляй при деактивации;
+постоянный HUD здоровья работает пока сам HUD включён. При наличии события
+изменения предпочитай его таймеру. `❌`-примеры намеренно показывают нарушения.
+
 ---
 
 ## Содержание
@@ -27,53 +33,42 @@
 **Решения:**
 
 ```lua
--- ✅ Проверка дистанции перед рендером
-hook.Add("PostDrawTranslucentRenderables", "Optimized3D2D", function(bDrawingDepth, bDrawingSkybox)
-    -- ВАЖНО: этот хук вызывается НЕСКОЛЬКО раз за кадр (depth-проход, скайбокс).
-    -- Без этой проверки весь код ниже выполняется 2-3 раза за кадр впустую!
-    if bDrawingDepth or bDrawingSkybox then return end
-
-    local ply = LocalPlayer()
-    local plyPos = ply:GetPos()
-
-    for _, ent in ipairs(ents.FindByClass("my_entity")) do
-        local dist = plyPos:DistToSqr(ent:GetPos()) -- DistToSqr быстрее чем Distance()
-
-        if dist > 500 * 500 then continue end -- 500 юнитов = порог видимости
-
-        -- Дополнительно: проверка видимости (PVS)
-        if not ent:IsOnScreen() then continue end
-
-        -- Рендерим 3D2D только если близко и видно
-        local pos = ent:GetPos() + ent:GetUp() * 80
-        local ang = ent:GetAngles()
-        ang:RotateAroundAxis(ang:Up(), 90)
-
-        cam.Start3D2D(pos, ang, 0.1)
-            draw.SimpleText("Текст", "Default", 0, 0, color_white, TEXT_ALIGN_CENTER)
-        cam.End3D2D()
-    end
+-- CLIENT: labelEntities — набор нужного класса из событий создания/удаления (§2.5).
+-- Источник фичи вызывает событие при активации/деактивации и смене состава.
+hook.Add("MyAddon.LabelsChanged", "Labels_CacheLifecycle", function(active)
+    if not active or not next(labelEntities) then timer.Remove("Labels_Cache"); return end
+    if timer.Exists("Labels_Cache") then return end
+    timer.Create("Labels_Cache", 0.1, 0, function()
+        local ply = LocalPlayer()
+        if not IsValid(ply) then return end
+        local plyPos = ply:GetPos()
+        for ent in pairs(labelEntities) do
+            if IsValid(ent) then
+                local dist = plyPos:DistToSqr(ent:GetPos())
+                ent.LabelLOD = dist > 1000 * 1000 and 0 or (dist > 500 * 500 and 1 or 2)
+            end
+        end
+    end)
 end)
-```
 
-**Уровни детализации (LOD) для 3D2D:**
-
-```lua
--- ✅ Разные уровни детализации по дистанции
-local function Render3D2DLOD(ent, plyPos)
-    local distSqr = plyPos:DistToSqr(ent:GetPos())
-
-    if distSqr > 1000 * 1000 then
-        return -- Не рендерим вообще
-    elseif distSqr > 500 * 500 then
-        -- Упрощённый рендер (только имя)
-        RenderSimpleLabel(ent)
-    else
-        -- Полный рендер (имя, HP, доп. информация)
-        RenderFullInfo(ent)
-    end
+-- В клиентском файле SENT: движок сам решает, какие энтити рисовать.
+function ENT:DrawTranslucent()
+    self:DrawModel()
+    if not self.LabelLOD or self.LabelLOD == 0 then return end
+    -- Актуальный transform движущейся энтити нужен именно в кадре.
+    local pos = self:GetPos() + self:GetUp() * 80
+    local ang = self:GetAngles()
+    ang:RotateAroundAxis(ang:Up(), 90)
+    cam.Start3D2D(pos, ang, 0.1)
+        if self.LabelLOD == 1 then RenderSimpleLabel(self) else RenderFullInfo(self) end
+    cam.End3D2D()
 end
 ```
+
+Таймер `Labels_Cache` включай только пока активна фича и набор непустой;
+снимай при деактивации. Готовый текст и его размеры обновляй по событию.
+
+`RenderSimpleLabel` / `RenderFullInfo` только рисуют готовый кэш.
 
 ### 1.2. HUD-оптимизация
 
@@ -82,43 +77,21 @@ end
 **Решения:**
 
 ```lua
--- ✅ Кэширование данных, которые не меняются каждый кадр
-local cachedHealth = 0
-local cachedArmor = 0
-local nextUpdate = 0
-
-hook.Add("HUDPaint", "OptimizedHUD", function()
-    local curTime = CurTime()
-
-    -- Обновляем данные раз в 0.1 секунды, а не каждый кадр
-    if curTime > nextUpdate then
-        cachedHealth = LocalPlayer():Health()
-        cachedArmor = LocalPlayer():Armor()
-        nextUpdate = curTime + 0.1
-    end
-
-    draw.RoundedBox(8, 10, 10, 200, 30, Color(0, 0, 0, 200))
-    draw.SimpleText("HP: " .. cachedHealth, "Default", 20, 18, color_white)
-end)
-```
-
-```lua
--- ✅ ЕЩЁ ЛУЧШЕ — обновление кэша таймером ВНЕ рендер-хука
+-- ✅ Обновление кэша таймером ВНЕ рендер-хука
 -- HUDPaint вообще не тратит время на проверки CurTime и сбор данных:
 -- таймер обновляет кэш 10 раз/сек, хук только рисует готовое.
-local cachedHealth = 0
-local cachedArmor = 0
+local hpText = ""
+local background = Color(0, 0, 0, 200)
 
 timer.Create("HUD_CacheUpdate", 0.1, 0, function()
     local ply = LocalPlayer()
     if not IsValid(ply) then return end
-    cachedHealth = ply:Health()
-    cachedArmor = ply:Armor()
+    hpText = "HP: " .. ply:Health()
 end)
 
 hook.Add("HUDPaint", "TimerCachedHUD", function()
-    draw.RoundedBox(8, 10, 10, 200, 30, Color(0, 0, 0, 200))
-    draw.SimpleText("HP: " .. cachedHealth, "Default", 20, 18, color_white)
+    draw.RoundedBox(8, 10, 10, 200, 30, background)
+    draw.SimpleText(hpText, "Default", 20, 18, color_white)
 end)
 -- Плюс: сбор данных выполняется 10 раз/сек вместо 144 (FPS) раз/сек.
 -- Подходит для всего, что не обязано обновляться покадрово:
@@ -174,37 +147,36 @@ hook.Add("HUDPaint", "Bad", function()
     draw.SimpleText(text, "MyFont", ScrW() / 2, ScrH() - 50, col)
 end)
 
--- ✅ ХОРОШО — ноль аллокаций в кадре
+-- ✅ ХОРОШО — данные и строка готовятся вне кадра
 local hpColor = Color(255, 0, 0, 200)
 local hpText = "HP: 100"
-local lastHP = -1
 local x, y = ScrW() / 2, ScrH() - 50   -- кэш размеров экрана
 
 hook.Add("OnScreenSizeChanged", "MyHUD_Relayout", function()
     x, y = ScrW() / 2, ScrH() - 50     -- пересчёт ТОЛЬКО при смене разрешения
 end)
 
+timer.Create("MyHUD_HealthCache", 0.1, 0, function()
+    local ply = LocalPlayer()
+    if IsValid(ply) then hpText = "HP: " .. ply:Health() end
+end)
+
 hook.Add("HUDPaint", "Good", function()
-    local hp = LocalPlayer():Health()
-    if hp ~= lastHP then               -- строка пересоздаётся только при изменении HP
-        lastHP = hp
-        hpText = "HP: " .. hp
-    end
     draw.SimpleText(hpText, "MyFont", x, y, hpColor)
 end)
 ```
 
-**Кэшируйте `surface.GetTextSize`** — это один из самых дорогих вызовов surface-библиотеки. Размер текста меняется только когда меняется сам текст:
+**Кэшируйте `surface.GetTextSize`** — это один из самых дорогих вызовов surface-библиотеки. Вызывай helper на событии смены текста или шрифта; в кадре читай уже готовые размеры:
 
 ```lua
 local cachedW, cachedH = 0, 0
-local measuredText = nil
+local measuredText, measuredFont
 
 local function GetTextSizeCached(text, font)
-    if text ~= measuredText then
+    if text ~= measuredText or font ~= measuredFont then
         surface.SetFont(font)
         cachedW, cachedH = surface.GetTextSize(text)
-        measuredText = text
+        measuredText, measuredFont = text, font
     end
     return cachedW, cachedH
 end
@@ -233,7 +205,9 @@ hook.Add("HUDShouldDraw", "MyHUD_Hide", function(name)
 end)
 ```
 
-**Early-out первым делом.** Если HUD не должен рисоваться (игрок мёртв, спектатор, меню открыто) — выходите первой строкой, до любых вычислений.
+**Неактивный HUD снимается событием.** Смерть, смена режима или закрытие меню
+снимают хук (§1.9). Early-out оставляй только для условия, которое действительно
+нужно проверять в текущем кадре; он не заменяет жизненный цикл хука.
 
 ### 1.3. Render Targets (RT) для сложных UI
 
@@ -319,24 +293,11 @@ ent:DrawShadow(false)          -- + отключаем тень
 
 ```lua
 -- ✅ Проверка дистанции перед воспроизведением
-function PlaySoundOptimized(ent, soundPath, maxDist)
-    maxDist = maxDist or 800
-
-    if SERVER then
-        -- Фильтруем игроков по дистанции
-        local recipients = RecipientFilter()
-        local pos = ent:GetPos()
-
-        for _, ply in ipairs(player.GetAll()) do
-            if ply:GetPos():DistToSqr(pos) <= maxDist * maxDist then
-                recipients:AddPlayer(ply)
-            end
-        end
-
-        if recipients:GetCount() > 0 then
-            ent:EmitSound(soundPath, 75, 100, 1, CHAN_AUTO)
-        end
-    end
+function PlaySoundOptimized(ent, soundPath)
+    if not SERVER or not IsValid(ent) then return end
+    local recipients = RecipientFilter()
+    recipients:AddPAS(ent:GetPos()) -- движковая область потенциальной слышимости
+    ent:EmitSound(soundPath, 75, 100, 1, CHAN_AUTO, 0, 1, recipients)
 end
 
 -- ✅ Ограничение частоты звуков (антиспам)
@@ -382,18 +343,24 @@ end
 ### 1.6. Партиклы и эффекты
 
 ```lua
--- ✅ Ограничение партиклов по дистанции
-hook.Add("PostDrawTranslucentRenderables", "OptimizedParticles", function()
-    local plyPos = LocalPlayer():GetPos()
-
-    for _, ent in ipairs(ents.FindByClass("particle_emitter_entity")) do
-        if plyPos:DistToSqr(ent:GetPos()) > 1500 * 1500 then
-            -- Не рендерим партиклы далеко от игрока
-            ent:SetNoDraw(true)
-        else
-            ent:SetNoDraw(false)
+-- ✅ CLIENT: emitterEntities поддерживается на создании/удалении (§2.5).
+hook.Add("MyAddon.EmittersChanged", "Particles_Lifecycle", function(active)
+    if not active or not next(emitterEntities) then timer.Remove("Particles_Distance"); return end
+    if timer.Exists("Particles_Distance") then return end
+    timer.Create("Particles_Distance", 0.1, 0, function()
+        local ply = LocalPlayer()
+        if not IsValid(ply) then return end
+        local plyPos = ply:GetPos()
+        for ent in pairs(emitterEntities) do
+            if IsValid(ent) then
+                local hidden = plyPos:DistToSqr(ent:GetPos()) > 1500 * 1500
+                if ent.DistanceHidden ~= hidden then
+                    ent.DistanceHidden = hidden
+                    ent:SetNoDraw(hidden)
+                end
+            end
         end
-    end
+    end)
 end)
 
 -- ✅ Авто-удаление ParticleEmitter
@@ -429,17 +396,13 @@ end)
 
 ```lua
 -- ✅ В начале файла — один раз при загрузке
-local math_floor   = math.floor
 local surface_SetDrawColor = surface.SetDrawColor
 local surface_DrawRect     = surface.DrawRect
-local CurTime      = CurTime
-local IsValid      = IsValid
 
 hook.Add("HUDPaint", "MyHUD", function()
     -- Внутри — только локальные ссылки, ноль глобальных lookup'ов
-    local t = CurTime()
     surface_SetDrawColor(0, 0, 0, 200)
-    surface_DrawRect(10, 10, 200, math_floor(t % 100))
+    surface_DrawRect(10, 10, 200, 30)
 end)
 ```
 
@@ -450,18 +413,24 @@ end)
 `LocalPlayer()` возвращает NULL до полной инициализации клиента, поэтому кэшировать на этапе загрузки файла нельзя. Стандартный ленивый паттерн:
 
 ```lua
-local me -- upvalue за пределами хука
+local me, hpText = nil, "" -- upvalue за пределами хука
 
-hook.Add("HUDPaint", "MyHUD", function()
+timer.Create("MyHUD_PlayerCache", 0.1, 0, function()
     me = IsValid(me) and me or LocalPlayer()
     if not IsValid(me) then return end
+    hpText = "HP: " .. me:Health()
+end)
 
-    local hp = me:Health()
-    -- ...
+hook.Add("HUDPaint", "MyHUD", function()
+    draw.SimpleText(hpText, "Default", 20, 18, color_white)
 end)
 ```
 
 #### 1.8.3. Кэширование результатов методов в кадре/цикле
+
+Этот приём нужен для неизбежной работы текущего кадра (например, линии к
+движущемуся объекту). Заменяемые проверки дистанции выполняй вне кадра.
+Локальная переменная внутри хука сама по себе не переносит работу из кадра.
 
 ```lua
 -- ❌ ПЛОХО — GetPos() вызывается 3 раза для одной и той же энтити
@@ -469,7 +438,7 @@ if ent:GetPos():DistToSqr(a) < r1 and ent:GetPos():DistToSqr(b) < r2 then
     render.DrawLine(ent:GetPos(), target)
 end
 
--- ✅ ХОРОШО — один вызов, дальше upvalue
+-- ✅ Один вызов в текущей обработке, дальше локальная переменная
 local pos = ent:GetPos()
 if pos:DistToSqr(a) < r1 and pos:DistToSqr(b) < r2 then
     render.DrawLine(pos, target)
@@ -483,11 +452,12 @@ end
 ```lua
 local drawPos = Vector(0, 0, 0)   -- создан один раз
 
-hook.Add("PostDrawTranslucentRenderables", "Reuse", function(bDepth, bSky)
-    if bDepth or bSky then return end
+-- Обновление готового значения вне кадра; отрисовка только читает drawPos.
+timer.Create("DrawPos_Cache", 0.1, 0, function()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
     drawPos:SetUnpacked(0, 0, 0)          -- сброс без новой аллокации
-    drawPos:Add(LocalPlayer():GetPos())
-    -- ...
+    drawPos:Add(ply:GetPos())
 end)
 
 -- То же с цветом: меняйте поле, не создавайте новый Color
@@ -503,10 +473,12 @@ hook.Add("Think", "Bad", function()
     ProcessPlayers(function(ply) return ply:Alive() end)
 end)
 
--- ✅ ХОРОШО — функция создана один раз
-local function isAlive(ply) return ply:Alive() end
-hook.Add("Think", "Good", function()
-    ProcessPlayers(isAlive)
+-- ✅ Вне кадра обрабатываются только участники набора из событий фичи.
+-- Таймер включай пока набор непустой; убирай при деактивации.
+timer.Create("Participants_Process", 0.1, 0, function()
+    for ply in pairs(activeParticipants) do
+        if IsValid(ply) and ply:Alive() then ProcessPlayer(ply) end
+    end
 end)
 ```
 
@@ -517,6 +489,10 @@ end)
 ```lua
 -- ✅ Хук существует только пока эффект активен
 local damageAlpha = 0
+local screenW, screenH = ScrW(), ScrH()
+hook.Add("OnScreenSizeChanged", "DamageOverlay_Layout", function()
+    screenW, screenH = ScrW(), ScrH()
+end)
 
 local function PaintDamageOverlay()
     damageAlpha = damageAlpha - FrameTime() * 100
@@ -526,7 +502,7 @@ local function PaintDamageOverlay()
     end
 
     surface.SetDrawColor(255, 0, 0, damageAlpha)
-    surface.DrawRect(0, 0, ScrW(), ScrH())
+    surface.DrawRect(0, 0, screenW, screenH)
 end
 
 net.Receive("PlayerHurtFX", function()
@@ -543,9 +519,9 @@ end)
 
 ```lua
 -- ✅ Хук автоматически умрёт вместе с энтити — утечка невозможна
-hook.Add("Think", someEntity, function(ent)
+hook.Add("MyAddonStateChanged", someEntity, function(ent)
     -- ent == someEntity
-    ent:DoSomething()
+    ent:RefreshCachedState()
 end)
 
 -- ✅ То же для панелей: закрыли меню — хук исчез
@@ -602,17 +578,27 @@ function ENT:Think()
     end
 end
 
--- ✅ ХОРОШО — тротлинг через NextThink
+-- ✅ SERVER: лечебная энтити с настроенными trigger bounds и SetTrigger(true).
+-- Движок поддерживает набор пациентов через вход/выход из trigger.
+function ENT:StartTouch(ent)
+    if not ent:IsPlayer() then return end
+    self.Patients = self.Patients or {}
+    self.Patients[ent] = true
+end
+
+function ENT:EndTouch(ent)
+    if self.Patients then self.Patients[ent] = nil end
+end
+
+-- Проверяем только пациентов, а NextThink задаёт нужную частоту.
 function ENT:Think()
-    local curTime = CurTime()
-
-    if (self.NextHealCheck or 0) > curTime then return end
-    self.NextHealCheck = curTime + 0.5 -- Проверяем 2 раза в секунду
-
-    local pos = self:GetPos()
-    for _, ply in ipairs(player.GetAll()) do
-        if ply:GetPos():DistToSqr(pos) < 200 * 200 then
-            self:HealPlayer(ply)
+    if self.Patients then
+        for ply in pairs(self.Patients) do
+            if not IsValid(ply) then
+                self.Patients[ply] = nil
+            elseif ply:Alive() then
+                self:HealPlayer(ply)
+            end
         end
     end
 
@@ -635,7 +621,7 @@ hook.Add("Think", "BadTimers", function()
             if IsValid(ply) then ply:SetHealth(100) end  -- 66 таймеров/сек × кол-во игроков
         end)
     end
-end)
+end
 -- При 20 игроках = ~1320 новых таймеров КАЖДУЮ СЕКУНДУ!
 
 -- ❌ ПЛОХО — timer.Create с одинаковым именем НЕ удаляет старый мгновенно
@@ -666,6 +652,10 @@ end)
 ```
 
 #### Мониторинг: сколько таймеров сейчас активно?
+
+Обёртки мониторинга ниже — временная диагностика с явным включением в
+`addons/dev_tests`; не добавляй их в production autorun. После замера
+восстанавливай оригинальные функции. Эти обёртки добавляют работу на вызов.
 
 ```lua
 -- ✅ Команда для диагностики количества активных таймеров
@@ -744,27 +734,6 @@ end)
 #### Правильные подходы
 
 ```lua
--- ✅ ХОРОШО — Удаление таймеров при дисконнекте
-hook.Add("PlayerInitialSpawn", "PlayerTimers", function(ply)
-    local sid = ply:SteamID64()
-
-    timer.Create("Regen_" .. sid, 1, 0, function()
-        if not IsValid(ply) then
-            timer.Remove("Regen_" .. sid) -- Самоочистка
-            return
-        end
-        ply:SetHealth(math.min(ply:Health() + 1, 100))
-    end)
-end)
-
-hook.Add("PlayerDisconnected", "CleanPlayerTimers", function(ply)
-    local sid = ply:SteamID64()
-    timer.Remove("Regen_" .. sid)
-    timer.Remove("Buff_" .. sid)
-    timer.Remove("Cooldown_" .. sid)
-    -- Удаляем ВСЕ таймеры, связанные с игроком
-end)
-
 -- ✅ ХОРОШО — Один таймер вместо N таймеров на каждого игрока
 -- ❌ Было: 64 таймера (по одному на игрока)
 for _, ply in ipairs(player.GetAll()) do
@@ -773,14 +742,34 @@ for _, ply in ipairs(player.GetAll()) do
     end)
 end
 
--- ✅ Стало: 1 таймер на всех
-timer.Create("GlobalRegen", 1, 0, function()
-    for _, ply in ipairs(player.GetAll()) do
-        if ply:Alive() and ply:Health() < 100 then
-            ply:SetHealth(math.min(ply:Health() + 1, 100))
+-- ✅ Стало: один таймер только для носителей эффекта, без полного обхода.
+local regenPlayers = {}
+
+local function RegenTick()
+    for ply in pairs(regenPlayers) do
+        if not IsValid(ply) then
+            regenPlayers[ply] = nil
+        elseif ply:Alive() then
+            local maxHP = ply:GetMaxHealth()
+            if ply:Health() < maxHP then ply:SetHealth(math.min(ply:Health() + 1, maxHP)) end
         end
     end
-end)
+    if not next(regenPlayers) then timer.Remove("GlobalRegen") end
+end
+
+local function SetRegenActive(ply, active)
+    regenPlayers[ply] = active and true or nil
+    if not next(regenPlayers) then
+        timer.Remove("GlobalRegen")
+    elseif not timer.Exists("GlobalRegen") then
+        timer.Create("GlobalRegen", 1, 0, RegenTick)
+    end
+end
+
+-- Источник статуса вызывает это событие при добавлении/снятии/истечении.
+hook.Add("MyAddon.RegenChanged", "Regen_Membership", SetRegenActive)
+hook.Add("PlayerDeath", "Regen_Death", function(ply) SetRegenActive(ply, false) end)
+hook.Add("PlayerDisconnected", "Regen_Disconnect", function(ply) SetRegenActive(ply, false) end)
 
 -- ✅ ХОРОШО — Батчинг: вместо 100 timer.Simple используем очередь
 local ActionQueue = {
@@ -830,7 +819,8 @@ ActionQueue:Add(5, function() print("Через 5 секунд") end)
 -- Вместо 2 отдельных timer.Simple — 1 таймер-процессор
 
 -- ✅ ХОРОШО — Использование Think + CurTime вместо таймеров
--- Для логики, привязанной к энтити, Think предпочтительнее таймеров
+-- Для необходимой периодической логики энтити NextThink задаёт частоту.
+-- Если есть событие изменения, используй его вместо любого polling.
 function ENT:Think()
     local curTime = CurTime()
 
@@ -868,29 +858,19 @@ end
 
 Сначала сократи число участников: для отдельной группы поддерживай набор
 на событиях и обходи его, не всех игроков через `player.Iterator()`/`GetAll`.
-Полный проход ниже уместен только если операция действительно касается всех.
+Полный проход допустим для разовой операции, которая действительно касается всех.
 Жизненный цикл набора, `SetupMove` и вложенный поиск цели — в
 [`event_driven.md`](event_driven.md), разделы 1, 3–4.
 
 ```lua
--- ✅ Использование ipairs для массивов (быстрее pairs для массивов)
--- ✅ Локальные ссылки на глобальные функции
-local IsValid = IsValid
-local CurTime = CurTime
-
--- ✅ Пред-выделение таблиц, минимизация table.insert
-local results = {}
-local count = 0
-for _, ply in ipairs(player.GetAll()) do
-    if ply:Alive() then
-        count = count + 1
-        results[count] = ply -- Быстрее чем table.insert(results, ply)
-    end
+-- ✅ Набор [ply] = true поддерживается событиями добавления/удаления (§2.2).
+-- Не создавай его заново через GetAll/Iterator в каждом вызове.
+for ply in pairs(activeParticipants) do
+    if IsValid(ply) then ProcessPlayer(ply) end
 end
 
--- ✅ Кэширование player.GetAll() если используется многократно
-local allPlayers = player.GetAll()
--- ... используем allPlayers в нескольких циклах ...
+-- ipairs нужен для готового массива; pairs — для набора с ключами-игроками.
+-- Кэш полного списка уменьшает аллокации, но не количество проверяемых игроков.
 ```
 
 ### 2.4. Entity Networking (NW/NW2/DTVar)
@@ -903,9 +883,11 @@ function ENT:Think()
     self:SetNWFloat("health_percent", self:Health() / self:GetMaxHealth())
 end
 
--- ✅ ХОРОШО — обновление только при изменении
-function ENT:Think()
-    local newPercent = math.Round(self:Health() / self:GetMaxHealth(), 2)
+-- ✅ Вызывай после изменения Health/MaxHealth в общих функциях их записи.
+-- Не вызывай из Think: сравнение результата не устраняет покадровый расчёт.
+function ENT:UpdateHealthPercent()
+    local maxHP = self:GetMaxHealth()
+    local newPercent = maxHP > 0 and math.Round(self:Health() / maxHP, 2) or 0
     if self._lastHealthPercent ~= newPercent then
         self._lastHealthPercent = newPercent
         self:SetNWFloat("health_percent", newPercent)
@@ -936,18 +918,32 @@ hook.Add("Think", "FindEntities", function()
     local npcs = ents.FindByClass("npc_*") -- Полный перебор всех энтити!
 end)
 
--- ✅ ХОРОШО — кэш обновляется таймером, Think вообще не участвует
--- (Think-вариант с проверкой CurTime всё равно вызывается каждый тик
--- только ради проверки времени — таймер делает это бесплатно)
+-- ✅ Состав группы поддерживается событиями, без повторного поиска по миру.
 local cachedNPCs = {}
 
-timer.Create("NPCCacheUpdate", 1, 0, function()
-    cachedNPCs = ents.FindByClass("npc_*") -- Раз в секунду, а не 66 проверок/сек
+local function RememberNPC(ent)
+    if IsValid(ent) and ent:IsNPC() then cachedNPCs[ent] = true end
+end
+
+hook.Add("OnEntityCreated", "NPCMembership_Add", function(ent)
+    timer.Simple(0, function() RememberNPC(ent) end) -- дождаться инициализации
+end)
+hook.Add("EntityRemoved", "NPCMembership_Remove", function(ent)
+    cachedNPCs[ent] = nil
+end)
+hook.Add("InitPostEntity", "NPCMembership_Initial", function()
+    for _, ent in ipairs(ents.FindByClass("npc_*")) do RememberNPC(ent) end
 end)
 
--- ✅ Использование ents.FindInSphere вместо ручной проверки дистанции
-local nearbyEnts = ents.FindInSphere(pos, 500) -- Оптимизировано движком
+-- При hot reload сделай один начальный проход для уже существующих NPC.
+-- Для labelEntities/emitterEntities меняется только условие RememberNPC.
 ```
+
+`ents.FindInSphere` не является бесплатным пространственным индексом: он
+проверяет bounding boxes всех энтити. Не заменяй им полный обход вслепую.
+Для постоянной зоны используй trigger и набор участников (§2.1), для разового
+прицеливания — подходящий trace/FindAlongRay. Таймер нужен для меняющихся
+данных участников, а не для постоянного пересоздания их списка.
 
 ### 2.6. Prop/Entity лимиты
 
@@ -1065,21 +1061,28 @@ hook.Add("Think", "SyncData", function()
     net.Broadcast()
 end)
 
--- ✅ ХОРОШО — рассылка при изменении, с тротлингом
-local lastBroadcast = {}
+-- ✅ SERVER: изменение запускает один отложенный пакет самому игроку.
+-- Не сбрасывай таймер на каждом ударе: пакет доставит последнее состояние.
+util.AddNetworkString("SyncHP")
+local function QueueHealthSync(ply)
+    local id = "SyncHP_" .. ply:EntIndex()
+    if timer.Exists(id) then return end
+    timer.Create(id, 0.2, 1, function()
+        if not IsValid(ply) then return end
+        net.Start("SyncHP")
+            net.WriteUInt(math.Clamp(ply:Health(), 0, 65535), 16)
+        net.Send(ply)
+    end)
+end
 
-hook.Add("EntityTakeDamage", "SyncOnDamage", function(ent, dmg)
-    if not ent:IsPlayer() then return end
-
-    local key = ent:SteamID64()
-    if (lastBroadcast[key] or 0) + 0.2 > CurTime() then return end
-    lastBroadcast[key] = CurTime()
-
-    net.Start("SyncHP")
-        net.WriteEntity(ent)
-        net.WriteUInt(ent:Health(), 8)
-    net.Broadcast()
+hook.Add("PostEntityTakeDamage", "SyncOnDamage", function(ent, dmg, took)
+    if took and ent:IsPlayer() then QueueHealthSync(ent) end
 end)
+hook.Add("PlayerSpawn", "SyncOnSpawn", QueueHealthSync)
+hook.Add("PlayerDisconnected", "SyncHP_Cleanup", function(ply)
+    timer.Remove("SyncHP_" .. ply:EntIndex())
+end)
+-- Источники лечения и смены MaxHealth тоже вызывают QueueHealthSync.
 ```
 
 ### 3.3. RecipientFilter — не отправлять всем
@@ -1089,21 +1092,12 @@ end)
 net.Start("LocalEffect")
 net.Broadcast() -- Все 128 игроков получают сообщение о локальном эффекте
 
--- ✅ ХОРОШО — Отправка только тем, кто рядом
+-- ✅ Для видимого локального эффекта используй движковый PVS.
 net.Start("LocalEffect")
     net.WriteVector(effectPos)
-net.Send(GetNearbyPlayers(effectPos, 1000))
-
-function GetNearbyPlayers(pos, radius)
-    local radiusSqr = radius * radius
-    local result = {}
-    for _, ply in ipairs(player.GetAll()) do
-        if ply:GetPos():DistToSqr(pos) <= radiusSqr then
-            result[#result + 1] = ply
-        end
-    end
-    return result
-end
+net.SendPVS(effectPos)
+-- PVS — потенциальная видимость, не строгий радиус.
+-- Если нужен именно радиус/роль, фильтруй поддерживаемую группу подписчиков.
 ```
 
 ---
@@ -1679,7 +1673,7 @@ ScanDirectory("addons")
 -- ❌ ОПАСНО — серверный конфиг доступен клиентам
 resource.AddFile("cfg/server.cfg")
 
--- ✅ Только необходимые файлы
+-- Только файлы, которых НЕТ в подключённом Workshop-контенте:
 resource.AddFile("materials/my_addon/icon.png")
 resource.AddFile("sound/my_addon/effect.wav")
 
@@ -1722,6 +1716,10 @@ end
 
 ### 8.1. Анти-спидхак
 
+Проверка текущей команды движения — исключение из замедления до 0.1с:
+редкий таймер может пропустить короткое нарушение. Оставляй необходимый
+контроль в movement-хуке; постоянные коэффициенты готовь вне него.
+
 ```lua
 -- ✅ Серверная проверка скорости передвижения
 hook.Add("Move", "AntiSpeedhack", function(ply, mv)
@@ -1743,6 +1741,9 @@ end)
 ```
 
 ### 8.2. Анти-телепорт / Noclip exploit
+
+Если контролируется смещение за тик, частота проверки является частью
+правила безопасности. Не меняй её без пересмотра порогов и модели угроз.
 
 ```lua
 -- ✅ Отслеживание телепортации
@@ -1888,6 +1889,10 @@ addon/
 
 ### 9.2. Мониторинг производительности
 
+Профайлер ниже намеренно считает время каждого вызова и создаёт таблицу
+результатов. Это временная диагностика в среде разработки, а не production
+оптимизация: храни её в `addons/dev_tests`, включай явно и снимай после замера.
+
 ```lua
 -- ✅ Профайлер для отслеживания тяжёлых хуков
 local hookProfile = {}
@@ -1939,6 +1944,12 @@ end)
 - [ ] Временные хуки снимаются через `hook.Remove` / entity-идентификатор
 - [ ] `HUDShouldDraw` использует lookup-таблицу
 - [ ] Think-хуки используют тротлинг (не каждый тик)
+- [ ] Групповые задачи обходят набор участников из событий, не всех игроков
+- [ ] Любая заменяемая математика/обработка вынесена из кадра на событие/таймер
+- [ ] SetupMove читает готовые данные и содержит только необходимую movement-логику
+- [ ] HUD получает изменения адресно; countdown не требует серверного polling
+- [ ] Тесты и массовые самопроверки находятся в `addons/dev_tests`
+- [ ] Workshop-контент не дублируется через `resource.AddFile`
 - [ ] Коллизии отключены для декоративных объектов
 - [ ] Звуки не воспроизводятся без проверки дистанции
 - [ ] Net-сообщения минимальны по размеру

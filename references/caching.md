@@ -40,17 +40,24 @@
 
 ## 1. Эталон: таймер наполняет, кадр рисует
 
-Плоские локалы, один именованный таймер, в хуке ни одного вызова движка.
+Плоские локалы, один именованный таймер; в хуке только отрисовка.
 
 ```lua
-local hp, armor, job, money, arrested, lockdownText
+local hpText, armor, job, money, arrested = "", 0, "", 0, false
+local draw_SimpleText = draw.SimpleText
+local col_white = color_white
+local textY = ScrH() - 32
+
+hook.Add("OnScreenSizeChanged", "MyHUD_Layout", function()
+    textY = ScrH() - 32
+end)
 
 hook.Add("InitPostEntity", "MyHUD_Cache", function()
     timer.Create("MyHUD_Cache", 0.4, 0, function()
         local ply = LocalPlayer()
         if not IsValid(ply) then return end
 
-        hp       = ply:Health()
+        hpText   = ply:Health() .. "%"
         armor    = ply:Armor()
         job      = ply:getDarkRPVar("job")
         money    = ply:getDarkRPVar("money")
@@ -59,7 +66,7 @@ hook.Add("InitPostEntity", "MyHUD_Cache", function()
 end)
 
 hook.Add("HUDPaint", "MyHUD", function()
-    draw_SimpleText(hp .. "%", "MyFont", 80, scrH - 32, col_white, TEXT_ALIGN_CENTER)
+    draw_SimpleText(hpText, "MyFont", 80, textY, col_white)
     -- ...
 end)
 ```
@@ -111,17 +118,15 @@ end
 local drawable = {}
 
 hook.Add("PostPlayerDraw", "Tags_Mark", function(ply)
-    drawable[ply] = true
+    if tagPlayers[ply] then drawable[ply] = true end -- группа из событий фичи
 end)
 
 hook.Add("PostDrawTranslucentRenderables", "Tags_Draw", function(depth, skybox)
     if depth or skybox then return end
 
-    for _, ply in ipairs(cachedPlayers) do -- список тоже из таймера
-        if drawable[ply] then
-            drawable[ply] = false -- гасим сразу: следующий кадр поставит заново
-            DrawTag(ply)
-        end
+    for ply in pairs(drawable) do -- только реально отрисованные участники группы
+        drawable[ply] = nil
+        if IsValid(ply) then DrawTag(ply) end
     end
 end)
 ```
@@ -192,9 +197,9 @@ end
 
 ## 5. Строки и замеры
 
-Строку пересобирать только при смене значения, из которого она собрана.
-Внутри таймера на 10 Гц отдельные метки-часовые уже не нужны — три коротких
-конкатенации на тик дешевле лишнего состояния, которое надо сбрасывать руками.
+Строку пересобирать вне кадра при смене значения. В таймере на 10 Гц
+простую строку можно пересобирать сразу; проверка смены секунды нужна,
+если вместе со строкой повторяются замеры текста или сборка сложного UI.
 
 ```lua
 -- в таймере
@@ -244,8 +249,8 @@ render_OverrideBlend(false)
   `math.Round`, `math.max`) осталась в кадре и зовётся оттуда десятки раз;
 - закэширована арифметика на десяток операций, а рядом в том же кадре два
   полноэкранных `render.UpdateScreenEffectTexture` и `Material:Recompute`;
-- метки-часовые «сменилась ли секунда» **внутри** таймера, который и так
-  тикает 10 раз в секунду;
+- проверка «сменилась ли секунда» в кадре вместо обновления готовой строки
+  вне кадра;
 - посчитаны и сохранены числа, а дорогая часть (десятки `DrawRect`) осталась.
 
 Проверка одна: **сколько операций ушло из кадра и сколько там осталось.** Если
@@ -280,7 +285,8 @@ draw.SimpleText(txt, font, x, y, Color(255, 255, 255, 255))
 ## Чеклист для рендер-хука
 
 1. Есть ли здесь вызов движка (`Health`, `GetNW*`, `getDarkRPVar`, `ConVar:Get*`,
-   `ScrW`, `GetEyeTrace`, `player.GetAll`)? → в таймер.
+   `ScrW`, `GetEyeTrace`)? → на событие или в активный таймер; необходимую
+   проекцию/анимацию оставь в кадре. `player.GetAll` → сначала набор группы.
 2. Есть ли конкатенация, `string.format`, `Color()`, `Vector()`, `{}`? → в
    таймер или в загрузку файла.
 3. Есть ли арифметика, результат которой одинаков между кадрами? → в

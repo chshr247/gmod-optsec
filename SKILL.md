@@ -1,6 +1,7 @@
 ---
 name: gmod-optsec
-description: Garry's Mod server/addon performance optimization and security hardening. Use whenever the user writes, reviews, or debugs GLua code that touches hot paths (HUDPaint, Think, Tick, render hooks, timers, net messages), complains about FPS drops, server lag, GC hitches, or asks about GMod security — net message validation, exploits, backdoors, rate limiting, DDoS protection, anticheat. Trigger on mentions of "оптимизация", "фпс", "лаги", "худ", "hook", "timer", "net", "безопасность", "эксплойт" in a GMod context, even if the user doesn't say "optimization" explicitly. Complements the glua skill: glua gives exact API signatures, this skill gives the performance/security rules.
+description: >-
+  Garry's Mod server/addon performance optimization and security hardening. Use whenever the user writes, reviews, or debugs GLua code that touches hot paths (HUDPaint, Think, Tick, render hooks, timers, net messages), complains about FPS drops, server lag, GC hitches, or asks about GMod security — net message validation, exploits, backdoors, rate limiting, DDoS protection, anticheat. Trigger on mentions of "оптимизация", "фпс", "лаги", "худ", "hook", "timer", "net", "безопасность", "эксплойт" in a GMod context, even if the user doesn't say "optimization" explicitly. Complements the glua skill: glua gives exact API signatures, this skill gives the performance/security rules.
 ---
 
 # GMod Optimization & Security
@@ -65,7 +66,8 @@ description: Garry's Mod server/addon performance optimization and security hard
    `CurTime()` уходит из кадра. Считать надо **на источнике изменения**:
    разрешение → `OnScreenSizeChanged`, настройка → `cvars.AddChangeCallback`,
    пакет → `net.Receive`, видимость → `PostPlayerDraw`/`RenderOverride`.
-   В кадре остаётся только анимация (`Lerp`/`Approach`), мышь и `Draw*`.
+   В кадре остаётся необходимая анимация (`Lerp`/`Approach`), актуальная
+   проекция/transform движущихся объектов, ввод и `Draw*`.
    Запомнить результат, оставив вычисление в кадре, — это не кэш
    (`references/caching.md`).
 4. **hook.Add → hook.Remove**: хук существует только пока нужен. Для хуков,
